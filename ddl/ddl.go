@@ -153,14 +153,15 @@ func NewDDLCase(cfg *DDLCaseConfig) *DDLCase {
 	cases := make([]*testCase, cfg.Concurrency)
 	for i := 0; i < cfg.Concurrency; i++ {
 		cases[i] = &testCase{
-			cfg:       cfg,
-			tables:    make(map[string]*ddlTestTable),
-			schemas:   make(map[string]*ddlTestSchema),
-			views:     make(map[string]*ddlTestView),
-			ddlOps:    make([]ddlTestOpExecutor, 0),
-			dmlOps:    make([]dmlTestOpExecutor, 0),
-			caseIndex: i,
-			stop:      0,
+			cfg:               cfg,
+			tables:            make(map[string]*ddlTestTable),
+			schemas:           make(map[string]*ddlTestSchema),
+			views:             make(map[string]*ddlTestView),
+			placementPolicies: map[string]*ddlTestPlacementPolicy{},
+			ddlOps:            make([]ddlTestOpExecutor, 0),
+			dmlOps:            make([]dmlTestOpExecutor, 0),
+			caseIndex:         i,
+			stop:              0,
 		}
 	}
 	b := &DDLCase{
@@ -409,8 +410,7 @@ func (c *testCase) execute(executeDDL ExecuteDDLFunc, exeDMLFunc ExecuteDMLFunc)
 	log.Infof("[ddl] [instance %d] Executing post round operations...", c.caseIndex)
 
 	if !c.cfg.MySQLCompatible {
-		err := c.executeAdminCheck()
-		if err != nil {
+		if err := c.executeAdminCheck(); err != nil {
 			return errors.Trace(err)
 		}
 	}
@@ -593,6 +593,8 @@ func (c *testCase) executeAdminCheck() error {
 		return nil
 	}
 
+	c.tablesLock.Lock()
+	defer c.tablesLock.Unlock()
 	// build SQL
 	sql := "ADMIN CHECK TABLE "
 	i := 0
@@ -605,6 +607,9 @@ func (c *testCase) executeAdminCheck() error {
 		for _, index := range table.indexes {
 			checkIndexSQL := fmt.Sprintf("admin check index `%s` `%s`", table.name, index.name)
 			_, err := c.pickupDB().Exec(checkIndexSQL)
+			if ddlIgnoreError(err) {
+				continue
+			}
 			if err != nil {
 				return errors.Annotatef(err, "Error when executing SQL: %s", checkIndexSQL)
 			}
