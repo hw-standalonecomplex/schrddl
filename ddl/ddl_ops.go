@@ -329,58 +329,123 @@ func (c *testCase) checkTable() error {
 			return errors.Errorf("table collate or comment doesn't match, table name: %s, expected collate:%s, comment:%s, got collate:%s, comment:%s", table.name, table.collate, table.comment, collate, comment)
 		}
 		// Check columns
-		var defaultValueRaw interface{}
-		var defaultValue string
-		var dateType string
-		for ite := table.columns.Iterator(); ite.Next(); {
-			column := ite.Value().(*ddlTestColumn)
-			row, err = c.dbs[0].Query(fmt.Sprintf("select COLUMN_DEFAULT, COLUMN_TYPE from information_schema.columns where table_name='%s' and column_name='%s'", table.name, column.name))
-			if err != nil {
-				return err
-			}
-			ok := row.Next()
-			if !ok {
-				return errors.New(fmt.Sprintf("no data for column %s, table %s", column.name, table.name))
-			}
-			err = row.Scan(&defaultValueRaw, &dateType)
+		if err := c.checkColumn(table); err != nil {
+			return err
+		}
+
+		if err := c.checkIndex(table); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (c *testCase) checkColumn(table *ddlTestTable) error {
+	var defaultValueRaw interface{}
+	var defaultValue string
+	var dateType string
+	for ite := table.columns.Iterator(); ite.Next(); {
+		column := ite.Value().(*ddlTestColumn)
+		row, err := c.dbs[0].Query(fmt.Sprintf("select COLUMN_DEFAULT, COLUMN_TYPE from information_schema.columns where table_name='%s' and column_name='%s'", table.name, column.name))
+		if err != nil {
+			return err
+		}
+		ok := row.Next()
+		if !ok {
+			return errors.New(fmt.Sprintf("no data for column %s, table %s", column.name, table.name))
+		}
+		err = row.Scan(&defaultValueRaw, &dateType)
+		if err != nil {
+			log.Errorf("error %s, stack %s", err.Error(), debug.Stack())
+			return err
+		}
+		row.Close()
+		if defaultValueRaw == nil {
+			defaultValue = "NULL"
+		} else {
+			defaultValue = fmt.Sprintf("%s", defaultValueRaw)
+		}
+		expectedDefault := getDefaultValueString(column.k, column.defaultValue)
+		expectedDefault = strings.Trim(expectedDefault, "'")
+		if column.k == KindTIMESTAMP {
+			t, err := time.ParseInLocation(TimeFormat, expectedDefault, Local)
 			if err != nil {
 				log.Errorf("error %s, stack %s", err.Error(), debug.Stack())
 				return err
 			}
-			row.Close()
-			if defaultValueRaw == nil {
-				defaultValue = "NULL"
-			} else {
-				defaultValue = fmt.Sprintf("%s", defaultValueRaw)
-			}
-			expectedDefault := getDefaultValueString(column.k, column.defaultValue)
-			expectedDefault = strings.Trim(expectedDefault, "'")
-			if column.k == KindTIMESTAMP {
-				t, err := time.ParseInLocation(TimeFormat, expectedDefault, Local)
-				if err != nil {
-					log.Errorf("error %s, stack %s", err.Error(), debug.Stack())
-					return err
-				}
-				t = t.UTC()
-				expectedDefault = t.Format(TimeFormat)
-			}
-			if !column.canHaveDefaultValue() {
-				expectedDefault = "NULL"
-			}
-			if !strings.EqualFold(defaultValue, expectedDefault) {
-				return errors.Errorf("column default value doesn't match, table %s, column %s, expected default:%s, got default:%s", table.name, column.name, strings.Trim(expectedDefault, "'"), defaultValue)
-			}
-			expectedFieldType := column.normalizeDataType()
-			if expectedFieldType == "xxx" {
-				// We don't know the column's charset for now, so skip the check for text/blob.
-				dateType = "xxx"
-			}
-			if !strings.EqualFold(dateType, expectedFieldType) {
-				return errors.Errorf("column field type doesn't match, table %s, column %s, expected default:%s, got default:%s", table.name, column.name, expectedFieldType, dateType)
+			t = t.UTC()
+			expectedDefault = t.Format(TimeFormat)
+		}
+		if !column.canHaveDefaultValue() {
+			expectedDefault = "NULL"
+		}
+		if !strings.EqualFold(defaultValue, expectedDefault) {
+			return errors.Errorf("column default value doesn't match, table %s, column %s, expected default:%s, got default:%s", table.name, column.name, strings.Trim(expectedDefault, "'"), defaultValue)
+		}
+		expectedFieldType := column.normalizeDataType()
+		if expectedFieldType == "xxx" {
+			// We don't know the column's charset for now, so skip the check for text/blob.
+			dateType = "xxx"
+		}
+		if !strings.EqualFold(dateType, expectedFieldType) {
+			return errors.Errorf("column field type doesn't match, table %s, column %s, expected default:%s, got default:%s", table.name, column.name, expectedFieldType, dateType)
+		}
+	}
+
+	return nil
+}
+
+func (c *testCase) checkIndex(table *ddlTestTable) error {
+	row, err := c.dbs[0].Query(fmt.Sprintf("select INDEX_NAME, SEQ_IN_INDEX, COLUMN_NAME, IS_VISIBLE from information_schema.statistics where TABLE_NAME = '%s'", table.name))
+	if err != nil {
+		return err
+	}
+	type idxCols struct {
+		seq  int
+		name string
+	}
+	type index struct {
+		isVisible bool
+		cols      []*idxCols
+	}
+
+	indexes := make(map[string]*index)
+	var indexName, seqInIndex, ColumnName, isVisible string
+	for row.Next() {
+		err = row.Scan(&indexName, &seqInIndex, &ColumnName, &isVisible)
+		if err != nil {
+			return err
+		}
+		if indexes[indexName] == nil {
+			indexes[indexName] = &index{isVisible: false, cols: make([]*idxCols, 0)}
+		}
+		seq, _ := strconv.Atoi(seqInIndex)
+		indexes[indexName].cols = append(indexes[indexName].cols, &idxCols{seq: seq, name: ColumnName})
+		indexes[indexName].isVisible = isVisible == "YES"
+	}
+
+	for _, idx := range indexes {
+		sort.Slice(idx.cols, func(i, j int) bool {
+			return idx.cols[i].seq < idx.cols[j].seq
+		})
+	}
+
+	for _, idx := range table.indexes {
+		localIdx := indexes[idx.name]
+		if localIdx == nil {
+			return errors.Errorf("table %s index %s not found in tidb", table.name, idx.name)
+		}
+		if len(idx.columns) != len(localIdx.cols) {
+			return errors.Errorf("table %s index %s columns number doesn't match, expected %d, got %d", table.name, idx.name, len(localIdx.cols), len(idx.columns))
+		}
+		for i := 0; i < len(idx.columns); i++ {
+			if localIdx.cols[i].name != idx.columns[i].name {
+				return errors.Errorf("table %s index %s column %d doesn't match, expected %s, got %s", table.name, idx.name, i, localIdx.cols[i].name, idx.columns[i].name)
 			}
 		}
 	}
-	return nil
+
+	return row.Close()
 }
 
 func getLastDDLInfo(conn *sql.Conn) (uint64, string, error) {
