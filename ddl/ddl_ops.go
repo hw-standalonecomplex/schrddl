@@ -373,7 +373,6 @@ func (c *testCase) checkColumn(table *ddlTestTable) error {
 				log.Errorf("error %s, stack %s", err.Error(), debug.Stack())
 				return err
 			}
-			t = t.UTC()
 			expectedDefault = t.Format(TimeFormat)
 		}
 		if !column.canHaveDefaultValue() {
